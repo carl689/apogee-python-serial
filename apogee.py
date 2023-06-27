@@ -1,15 +1,15 @@
 # Original https://www.apogeeinstruments.com/apogee-usb-sensors-and-linux/
 # chatGPT updated to python3, adding get logged data and CLI
 
-from serial import Serial
-
 from time import sleep
+
+import pandas as pd
 
 import struct
 import argparse
 import csv
 from datetime import datetime, timedelta
-from serial import Serial
+from serial import Serial, SerialException
 
 
 GET_VOLT = b'\x55!'
@@ -27,6 +27,13 @@ GET_LOGGED_ENTRY = b'\xf2%s!'
 ERASE_LOGGED_DATA = b'\xf4!'
 
 
+def try_convert_date(val):
+    try:
+        return pd.to_datetime(val)
+    except ValueError:
+        return pd.NaT  # Return 'not a time' for invalid dates
+
+
 class Quantum(object):
 
     def __init__(self, port):
@@ -41,9 +48,8 @@ class Quantum(object):
 
         and attempts to read the calibration values"""
 
-        self.quantum = Serial(self.port, 115200, timeout=0.5)
-
         try:
+            self.quantum = Serial(self.port, 115200, timeout=0.5)
 
             self.quantum.write(READ_CALIBRATION)
 
@@ -55,8 +61,8 @@ class Quantum(object):
 
             self.offset = struct.unpack('<f', offset)[0]
 
-        except IOError as data:
-            print(data)
+        except SerialException:
+            print("Can't locate device")
             self.quantum = None
 
     def get_micromoles(self):
@@ -197,6 +203,39 @@ class Quantum(object):
                     except IOError as data:
                         print(data)
 
+    def calculate_kwh(self, csv_file, min_val, max_val):
+        # specify column names in names parameter
+        data = pd.read_csv(csv_file, names=['timestamp', 'entry'])
+
+        # convert 'timestamp' column to datetime and handle errors
+        data['timestamp'] = data['timestamp'].apply(try_convert_date)
+
+        # remove rows with invalid dates
+        data = data.dropna(subset=['timestamp'])
+
+        # Convert 'entry' to numeric, force non-numeric values to NaN
+        data['entry'] = pd.to_numeric(data['entry'], errors='coerce')
+
+        # filter data
+        data = data[(data['entry'] >= min_val) & (data['entry'] <= max_val)]
+
+        # calculate sum of 'entry' for each day
+        daily_sum = data.resample('D', on='timestamp').sum()
+
+        # convert daily sum to kwh
+        daily_kwh = daily_sum['entry'] * 0.001 * (1/60)
+
+        print(daily_kwh)
+
+
+def calculate_solar_output(panel_count, panel_width, panel_height, panel_wattage, panel_efficiency, daily_kwh):
+    # Calculate panel area in square meters
+    panel_area = (panel_width / 1000) * (panel_height / 1000) * panel_count
+
+    # Calculate the total kWh produced by the solar panels for each day
+    total_kwh = daily_kwh * panel_area * panel_efficiency * panel_wattage
+    print(total_kwh)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -222,6 +261,27 @@ if __name__ == "__main__":
         '--get_micromoles',
         action='store_true',
         help='Get the micromoles from the device')
+    parser.add_argument(
+        '--calculate_kwh',
+        type=str,
+        help='Calculate the kWh from a logged entries CSV file')
+    parser.add_argument(
+        '--min_val',
+        type=int,
+        default=0,
+        help='Minimum value to consider in the kWh calculation')
+    parser.add_argument(
+        '--max_val',
+        type=int,
+        default=2000,
+        help='Maximum value to consider in the kWh calculation')
+    parser.add_argument(
+        '--calculate_solar_output',
+        nargs=6,
+        metavar=('PANEL_COUNT', 'PANEL_WIDTH', 'PANEL_HEIGHT',
+                 'PANEL_WATTAGE', 'PANEL_EFFICIENCY', 'DAILY_KWH'),
+        help='Calculate the total kWh produced by the solar panels for each day using the daily kWh values'
+    )
 
     args = parser.parse_args()
 
@@ -244,3 +304,19 @@ if __name__ == "__main__":
 
     if args.get_micromoles:
         print(q.get_micromoles())
+
+    if args.calculate_kwh:
+        kwh_per_day = q.calculate_kwh(
+            args.calculate_kwh, args.min_val, args.max_val)
+        print(kwh_per_day)
+
+    if args.calculate_solar_output:
+        panel_count, panel_width, panel_height, panel_wattage, panel_efficiency, daily_kwh = args.calculate_solar_output
+        calculate_solar_output(
+            int(panel_count),
+            int(panel_width),
+            int(panel_height),
+            int(panel_wattage),
+            float(panel_efficiency),
+            float(daily_kwh)
+        )
